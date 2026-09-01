@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Contact | Sports Data Analysis</title>
+  <style>
+    body { margin: 0; font-family: Arial, sans-serif; background: #f4f7fb; color: #1f2937; }
+    header, footer { background: #0f172a; color: white; text-align: center; padding: 25px 15px; }
+    nav { background: #111827; text-align: center; padding: 14px; }
+    nav a { color: white; margin: 8px; text-decoration: none; font-weight: bold; }
+    main { max-width: 700px; margin: auto; padding: 25px 15px; }
+    .card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 14px #0001; }
+    input, textarea { width: 100%; box-sizing: border-box; padding: 12px; margin: 8px 0 16px; border: 1px solid #cbd5e1; border-radius: 6px; }
+    button { background: #0284c7; color: white; border: 0; padding: 12px 20px; border-radius: 6px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Contact Us</h1>
+    <p>Send us your message</p>
+  </header>
+
+  <nav>
+    <a href="index.html">Home</a>
+    <a href="predictions.html">Predictions</a>
+    <a href="results.html">Results</a>
+    <a href="about.html">About</a>
+    <a href="contact.html">Contact</a>
+  </nav>
+
+  <main>
+    <div class="card">
+      <h2>Get in Touch</h2>
+      <form action="mailto:your-email@example.com" method="post" enctype="text/plain">
+        <label>Name</label>
+        <input type="text" name="name" required>
+
+        <label>Email</label>
+        <input type="email" name="email" required>
+
+        <label>Message</label>
+        <textarea name="message" rows="6" required></textarea>
+
+        <button type="submit">Send Message</button>
+      </form>
+    </div>
+  </main>
+
+  <footer>
+    <p>&copy; 2026 Sports Data Analysis & Predictions</p>
+  </footer>
+</body>
+</html>
