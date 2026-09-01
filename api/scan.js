@@ -3,8 +3,7 @@ export default async function handler(req, res) {
 
   if (!token) {
     return res.status(500).json({
-      error:
-        "SPORTMONKS_TOKEN is not configured in Vercel Production environment variables."
+      error: "SPORTMONKS_TOKEN is not configured in Vercel Production."
     });
   }
 
@@ -27,62 +26,59 @@ export default async function handler(req, res) {
     });
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 25000);
+    const timer = setTimeout(() => controller.abort(), 25000);
 
     try {
       const response = await fetch(url, {
         headers,
-        signal: controller.signal,
-        cache: "no-store"
+        signal: controller.signal
       });
 
       const text = await response.text();
 
-      let body;
+      let data = {};
 
       try {
-        body = JSON.parse(text);
+        data = text ? JSON.parse(text) : {};
       } catch {
-        body = { message: text };
+        data = {};
       }
 
       if (!response.ok) {
-        const message =
-          body?.message ||
-          body?.error ||
-          text ||
-          "Unknown SportMonks error";
-
-        throw new Error(`SportMonks ${response.status}: ${message}`);
+        throw new Error(
+          `SportMonks ${response.status}: ${
+            data.message || data.error || text || "Request failed"
+          }`
+        );
       }
 
-      return body;
+      return data;
     } catch (error) {
-      if (error?.name === "AbortError") {
-        throw new Error(
-          `SportMonks request timed out: ${path}`
-        );
+      if (error.name === "AbortError") {
+        throw new Error(`SportMonks request timed out: ${path}`);
       }
 
       throw error;
     } finally {
-      clearTimeout(timeout);
+      clearTimeout(timer);
     }
   }
 
-  function val(stat, names) {
+  function getStatValue(stat, names) {
     if (!stat) return null;
 
-    const name = String(
+    const typeName = String(
       stat.type?.name ||
-        stat.type?.developer_name ||
-        stat.type ||
-        ""
+      stat.type?.developer_name ||
+      stat.type ||
+      ""
     ).toLowerCase();
 
-    if (!names.some((n) => name.includes(n))) {
-      return null;
-    }
+    const matches = names.some((name) =>
+      typeName.includes(name)
+    );
+
+    if (!matches) return null;
 
     const raw =
       stat.data?.value ??
@@ -94,70 +90,76 @@ export default async function handler(req, res) {
     return Number.isFinite(number) ? number : 0;
   }
 
-  function statLocation(stat) {
+  function getLocation(stat) {
     return String(
-      stat?.location ||
-        stat?.meta?.location ||
-        ""
+      stat.location ||
+      stat.meta?.location ||
+      ""
     ).toLowerCase();
   }
 
   function statValue(stats, names, location) {
-    const hit = (stats || []).find((stat) => {
-      const value = val(stat, names);
+    const found = (stats || []).find((stat) => {
+      const value = getStatValue(stat, names);
 
-      if (value === null) {
-        return false;
-      }
+      if (value === null) return false;
 
-      if (!location) {
-        return true;
-      }
-
-      return statLocation(stat) === location;
+      return getLocation(stat) === location;
     });
 
-    return hit ? val(hit, names) : 0;
+    return found
+      ? getStatValue(found, names)
+      : 0;
   }
 
-  function teamIdFromFixture(fixture, side) {
+  function teamId(fixture, side) {
     const participants = fixture.participants || [];
 
-    const item =
+    const found =
       participants.find(
-        (x) =>
-          String(x.meta?.location || "").toLowerCase() === side
+        (p) =>
+          String(
+            p.meta?.location || ""
+          ).toLowerCase() === side
       ) ||
       participants.find(
-        (x) =>
-          String(x.location || "").toLowerCase() === side
+        (p) =>
+          String(
+            p.location || ""
+          ).toLowerCase() === side
       );
 
     return (
-      item?.id ||
-      item?.team_id ||
-      item?.participant_id
+      found?.id ||
+      found?.team_id ||
+      found?.participant_id
     );
   }
 
-  function nameFromFixture(fixture, side) {
+  function teamName(fixture, side) {
     const participants = fixture.participants || [];
 
-    const item =
+    const found =
       participants.find(
-        (x) =>
-          String(x.meta?.location || "").toLowerCase() === side
+        (p) =>
+          String(
+            p.meta?.location || ""
+          ).toLowerCase() === side
       ) ||
       participants.find(
-        (x) =>
-          String(x.location || "").toLowerCase() === side
+        (p) =>
+          String(
+            p.location || ""
+          ).toLowerCase() === side
       );
 
-    if (item?.name) {
-      return item.name;
+    if (found?.name) {
+      return found.name;
     }
 
-    const parts = String(fixture.name || "").split(" vs ");
+    const parts = String(
+      fixture.name || ""
+    ).split(" vs ");
 
     return (
       side === "home"
@@ -166,21 +168,14 @@ export default async function handler(req, res) {
     ) || side;
   }
 
-  function fixtureToRow(fixture, teamId) {
-    const homeId = teamIdFromFixture(
-      fixture,
-      "home"
-    );
-
-    const awayId = teamIdFromFixture(
-      fixture,
-      "away"
-    );
+  function fixtureStats(fixture, team) {
+    const homeId = teamId(fixture, "home");
+    const awayId = teamId(fixture, "away");
 
     const stats = fixture.statistics || [];
 
     const side =
-      String(homeId) === String(teamId)
+      String(homeId) === String(team)
         ? "home"
         : "away";
 
@@ -234,11 +229,11 @@ export default async function handler(req, res) {
         opponent
       ),
 
-      poss: statValue(
+      possession: statValue(
         stats,
         [
-          "possession",
-          "ball possession"
+          "ball possession",
+          "possession"
         ],
         side
       ),
@@ -246,8 +241,8 @@ export default async function handler(req, res) {
       attacks: statValue(
         stats,
         [
-          "attacks",
-          "dangerous attacks"
+          "dangerous attacks",
+          "attacks"
         ],
         side
       ),
@@ -261,28 +256,26 @@ export default async function handler(req, res) {
   }
 
   function weighted(values) {
-    const usable = values.filter((value) =>
-      Number.isFinite(value)
+    const valid = values.filter(
+      (x) => Number.isFinite(x)
     );
 
-    if (!usable.length) {
-      return 0;
-    }
+    if (!valid.length) return 0;
 
-    let sum = 0;
-    let weightSum = 0;
+    let total = 0;
+    let weightTotal = 0;
 
-    usable.slice(-20).forEach(
+    valid.slice(-20).forEach(
       (value, index) => {
         const weight = index + 1;
 
-        sum += value * weight;
-        weightSum += weight;
+        total += value * weight;
+        weightTotal += weight;
       }
     );
 
-    return weightSum
-      ? sum / weightSum
+    return weightTotal
+      ? total / weightTotal
       : 0;
   }
 
@@ -312,8 +305,8 @@ export default async function handler(req, res) {
         history.map((x) => x.cornersAgainst)
       ),
 
-      poss: weighted(
-        history.map((x) => x.poss)
+      possession: weighted(
+        history.map((x) => x.possession)
       ),
 
       attacks: weighted(
@@ -328,19 +321,25 @@ export default async function handler(req, res) {
     };
   }
 
-  function adjust(team, opponent, market) {
+  function styleAdjustment(team, opponent, market) {
     const possession =
-      (team.poss || 50) -
-      (opponent.poss || 50);
+      (team.possession || 50) -
+      (opponent.possession || 50);
 
     const pressure =
       (team.attacks || 0) /
-        (opponent.attacks || 1) -
+        Math.max(
+          opponent.attacks || 1,
+          1
+        ) -
       1;
 
     const width =
       (team.crosses || 0) /
-        (opponent.crosses || 1) -
+        Math.max(
+          opponent.crosses || 1,
+          1
+        ) -
       1;
 
     if (market === "corners") {
@@ -366,20 +365,12 @@ export default async function handler(req, res) {
       );
     }
 
-    return Math.max(
-      -1,
-      Math.min(
-        1,
-        possession * 0.003 +
-          pressure * 0.5
-      )
-    );
+    return 0;
   }
 
   function erf(x) {
     const sign = x < 0 ? -1 : 1;
     const a = Math.abs(x);
-
     const t =
       1 /
       (1 + 0.3275911 * a);
@@ -408,27 +399,28 @@ export default async function handler(req, res) {
     );
   }
 
-  function cdf(z) {
+  function normalCDF(z) {
     return (
       0.5 *
-      (
-        1 +
-        erf(z / Math.sqrt(2))
-      )
+      (1 + erf(z / Math.sqrt(2)))
     );
   }
 
-  function over(mean, line, sd) {
+  function overProbability(
+    mean,
+    line,
+    sd
+  ) {
+    const probability =
+      1 -
+      normalCDF(
+        (line - mean) /
+          Math.max(sd, 1)
+      );
+
     return Math.max(
       0.01,
-      Math.min(
-        0.99,
-        1 -
-          cdf(
-            (line - mean) /
-              Math.max(sd, 1)
-          )
-      )
+      Math.min(0.99, probability)
     );
   }
 
@@ -437,13 +429,16 @@ export default async function handler(req, res) {
     homeHistory,
     awayHistory
   ) {
-    const home = profile(homeHistory);
-    const away = profile(awayHistory);
+    const home =
+      profile(homeHistory);
+
+    const away =
+      profile(awayHistory);
 
     const homeShots =
       home.shots * 0.55 +
       away.shotsAgainst * 0.45 +
-      adjust(
+      styleAdjustment(
         home,
         away,
         "shots"
@@ -452,24 +447,24 @@ export default async function handler(req, res) {
     const awayShots =
       away.shots * 0.55 +
       home.shotsAgainst * 0.45 +
-      adjust(
+      styleAdjustment(
         away,
         home,
         "shots"
       );
 
-    const homeSot =
+    const homeSOT =
       home.sot * 0.55 +
       away.sotAgainst * 0.45;
 
-    const awaySot =
+    const awaySOT =
       away.sot * 0.55 +
       home.sotAgainst * 0.45;
 
     const homeCorners =
       home.corners * 0.55 +
       away.cornersAgainst * 0.45 +
-      adjust(
+      styleAdjustment(
         home,
         away,
         "corners"
@@ -478,7 +473,7 @@ export default async function handler(req, res) {
     const awayCorners =
       away.corners * 0.55 +
       home.cornersAgainst * 0.45 +
-      adjust(
+      styleAdjustment(
         away,
         home,
         "corners"
@@ -509,21 +504,21 @@ export default async function handler(req, res) {
       [
         "sot",
         `${fixture.home} SOT`,
-        homeSot,
+        homeSOT,
         3.5
       ],
 
       [
         "sot",
         `${fixture.away} SOT`,
-        awaySot,
+        awaySOT,
         2.5
       ],
 
       [
         "sot",
         "Match SOT",
-        homeSot + awaySot,
+        homeSOT + awaySOT,
         7.5
       ],
 
@@ -556,41 +551,46 @@ export default async function handler(req, res) {
         mean,
         line
       ]) => {
+        const safeMean =
+          Math.max(0, mean);
+
         const sd =
           market === "corners"
             ? Math.max(
                 1.8,
-                mean * 0.25
+                safeMean * 0.25
               )
             : market === "sot"
               ? Math.max(
                   1.4,
-                  mean * 0.24
+                  safeMean * 0.24
                 )
               : Math.max(
                   3,
-                  mean * 0.24
+                  safeMean * 0.24
                 );
 
         const probability =
-          over(
-            mean,
+          overProbability(
+            safeMean,
             line,
             sd
           );
 
-        const score = Math.round(
-          Math.max(
-            1,
-            Math.min(
-              95,
-              probability * 100
+        const score =
+          Math.round(
+            Math.max(
+              1,
+              Math.min(
+                95,
+                probability * 100
+              )
             )
-          )
-        );
+          );
 
         return {
-          match: `${fixture.home} vs ${fixture.away}`,
+          match:
+            `${fixture.home} vs ${fixture.away}`,
 
           league:
             fixture.league?.name ||
@@ -601,7 +601,7 @@ export default async function handler(req, res) {
 
           name,
 
-          mean,
+          mean: safeMean,
 
           line,
 
@@ -618,9 +618,11 @@ export default async function handler(req, res) {
                   ? "watch"
                   : "avoid",
 
-          // IMPORTANT:
-          // Convert number of matches to the
-          // frontend's 0-20 quality scale.
+          /*
+           * IMPORTANT:
+           * Frontend displays quality * 20.
+           * Therefore quality must be 0-1.
+           */
           quality:
             Math.min(
               home.n,
@@ -628,53 +630,51 @@ export default async function handler(req, res) {
             ) / 20,
 
           why:
-            `Weighted last-${Math.min(
-              home.n,
+            `Weighted historical data from up to ${Math.min(
+              Math.min(home.n, away.n),
               20
-            )} history, opponent concession and style pressure.`
+            )} previous matches, opponent concessions and playing style.`
         };
       }
     );
   }
 
   try {
-    // Get today's fixtures
-    const fixtureJson = await get(
-      `/fixtures/date/${date}`,
-      {
-        include:
-          "participants;league"
-      }
-    );
+    /*
+     * Today's fixtures
+     */
+    const fixtureResponse =
+      await get(
+        `/fixtures/date/${date}`,
+        {
+          include:
+            "participants;league"
+        }
+      );
 
     const fixtures =
-      (fixtureJson.data || [])
+      (fixtureResponse.data || [])
         .filter(
           (fixture) =>
-            !fixture.state_id ||
-            [1, 2, 3].includes(
-              Number(
-                fixture.state_id
-              )
-            )
+            fixture &&
+            fixture.participants &&
+            fixture.participants.length >= 2
         );
 
-    // Limit the number of fixtures so
-    // Vercel does not time out.
-    const fixturesToScan =
+    const selected =
       fixtures.slice(0, 12);
 
     const rows = [];
 
-    for (const fixture of fixturesToScan) {
+    for (const fixture of selected) {
       const homeId =
-        teamIdFromFixture(
+        teamId(
           fixture,
           "home"
         );
 
       const awayId =
-        teamIdFromFixture(
+        teamId(
           fixture,
           "away"
         );
@@ -683,63 +683,59 @@ export default async function handler(req, res) {
         continue;
       }
 
-      const start =
+      const fixtureDate =
         new Date(
-          new Date(
-            fixture.starting_at
-          ).getTime() -
-            1000 *
-              60 *
-              60 *
+          fixture.starting_at
+        );
+
+      const startDate =
+        new Date(
+          fixtureDate.getTime() -
+            180 *
               24 *
-              180
+              60 *
+              60 *
+              1000
         )
           .toISOString()
           .slice(0, 10);
 
       /*
        * IMPORTANT FIX:
-       * SportMonks historical fixture endpoint
-       * uses /between/date/
+       * This is the correct historical
+       * SportMonks endpoint.
        */
-
       const [
-        homeJson,
-        awayJson
+        homeHistoryResponse,
+        awayHistoryResponse
       ] = await Promise.all([
         get(
-          `/fixtures/between/date/${start}/${date}/${homeId}`,
+          `/fixtures/between/date/${startDate}/${date}/${homeId}`,
           {
             include:
               "participants;statistics.type",
-            per_page: 50,
-            order: "desc"
+            per_page: 50
           }
         ),
 
         get(
-          `/fixtures/between/date/${start}/${date}/${awayId}`,
+          `/fixtures/between/date/${startDate}/${date}/${awayId}`,
           {
             include:
               "participants;statistics.type",
-            per_page: 50,
-            order: "desc"
+            per_page: 50
           }
         )
       ]);
 
-      const fixtureTime =
-        new Date(
-          fixture.starting_at
-        );
-
       const homeHistory =
-        (homeJson.data || [])
+        (homeHistoryResponse.data || [])
           .filter(
-            (item) =>
+            (match) =>
+              match.starting_at &&
               new Date(
-                item.starting_at
-              ) < fixtureTime
+                match.starting_at
+              ) < fixtureDate
           )
           .sort(
             (a, b) =>
@@ -752,20 +748,21 @@ export default async function handler(req, res) {
           )
           .slice(-20)
           .map(
-            (item) =>
-              fixtureToRow(
-                item,
+            (match) =>
+              fixtureStats(
+                match,
                 homeId
               )
           );
 
       const awayHistory =
-        (awayJson.data || [])
+        (awayHistoryResponse.data || [])
           .filter(
-            (item) =>
+            (match) =>
+              match.starting_at &&
               new Date(
-                item.starting_at
-              ) < fixtureTime
+                match.starting_at
+              ) < fixtureDate
           )
           .sort(
             (a, b) =>
@@ -778,24 +775,31 @@ export default async function handler(req, res) {
           )
           .slice(-20)
           .map(
-            (item) =>
-              fixtureToRow(
-                item,
+            (match) =>
+              fixtureStats(
+                match,
                 awayId
               )
           );
+
+      if (
+        !homeHistory.length ||
+        !awayHistory.length
+      ) {
+        continue;
+      }
 
       rows.push(
         ...predict(
           {
             home:
-              nameFromFixture(
+              teamName(
                 fixture,
                 "home"
               ),
 
             away:
-              nameFromFixture(
+              teamName(
                 fixture,
                 "away"
               ),
@@ -805,6 +809,7 @@ export default async function handler(req, res) {
           },
 
           homeHistory,
+
           awayHistory
         )
       );
@@ -817,15 +822,20 @@ export default async function handler(req, res) {
         fixtures.length,
 
       scanned:
-        fixturesToScan.length,
+        selected.length,
 
       rows
     });
   } catch (error) {
+    console.error(
+      "SportMonks scan error:",
+      error
+    );
+
     return res.status(500).json({
       error:
         error?.message ||
-        "Live SportMonks scan failed."
+        "SportMonks API scan failed."
     });
   }
-    }
+  }
