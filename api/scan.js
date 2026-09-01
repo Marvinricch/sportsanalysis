@@ -3,42 +3,34 @@ export default async function handler(req, res) {
 
   if (!token) {
     return res.status(500).json({
-      error:
-        "SPORTMONKS_TOKEN is not configured in the Production environment."
+      error: "SPORTMONKS_TOKEN is missing from Vercel Production."
     });
   }
 
-  const date =
+  const requestedDate =
     String(req.query.date || new Date().toISOString().slice(0, 10));
 
-  const base =
-    "https://api.sportmonks.com/v3/football";
+  const base = "https://api.sportmonks.com/v3/football";
 
   async function get(path, params = {}) {
     const url = new URL(base + path);
 
     Object.entries(params).forEach(([key, value]) => {
-      if (value !== undefined && value !== null) {
-        url.searchParams.set(key, value);
-      }
+      url.searchParams.set(key, value);
     });
 
     const controller = new AbortController();
 
-    const timeout = setTimeout(
-      () => controller.abort(),
-      15000
-    );
+    const timer = setTimeout(() => {
+      controller.abort();
+    }, 15000);
 
     try {
       const response = await fetch(url, {
-        method: "GET",
-
         headers: {
           Authorization: token,
           Accept: "application/json"
         },
-
         signal: controller.signal
       });
 
@@ -53,131 +45,65 @@ export default async function handler(req, res) {
       }
 
       if (!response.ok) {
-        const message =
-          data?.message ||
-          data?.error ||
-          text ||
-          `SportMonks returned HTTP ${response.status}`;
-
         throw new Error(
-          `SportMonks ${response.status}: ${message}`
+          `SportMonks ${response.status}: ${
+            data.message ||
+            data.error ||
+            text ||
+            "Request failed"
+          }`
         );
       }
 
       return data;
-
     } catch (error) {
       if (error.name === "AbortError") {
         throw new Error(
-          "SportMonks request timed out after 15 seconds."
+          `SportMonks request timed out: ${path}`
         );
       }
 
       throw error;
-
     } finally {
-      clearTimeout(timeout);
+      clearTimeout(timer);
     }
   }
 
-  function val(stat, names) {
-    if (!stat) return 0;
-
-    const name = String(
-      stat.type?.name ||
-      stat.type?.developer_name ||
-      stat.type ||
-      ""
-    ).toLowerCase();
-
-    if (!names.some(n => name.includes(n))) {
-      return null;
-    }
-
-    const raw =
-      stat.data?.value ??
-      stat.value ??
-      stat.data;
-
-    const number = Number(raw);
-
-    return Number.isFinite(number)
-      ? number
-      : 0;
-  }
-
-  function statValue(stats, names, location) {
-    const hit = (stats || []).find(stat => {
-      const value = val(stat, names);
-
-      if (value === null) {
-        return false;
-      }
-
-      if (!location) {
-        return true;
-      }
-
-      return String(
-        stat.location || ""
-      ).toLowerCase() === location;
-    });
-
-    return hit
-      ? val(hit, names)
-      : 0;
-  }
-
-  function teamIdFromFixture(fixture, side) {
-    const participants =
-      fixture.participants || [];
-
-    const item =
-      participants.find(
-        x =>
-          String(
-            x.meta?.location || ""
-          ).toLowerCase() === side
-      ) ||
-      participants.find(
-        x =>
-          String(
-            x.location || ""
-          ).toLowerCase() === side
-      );
+  function participant(fixture, side) {
+    const participants = fixture.participants || [];
 
     return (
-      item?.id ||
-      item?.team_id ||
-      item?.participant_id
+      participants.find(
+        p =>
+          String(
+            p.meta?.location ||
+            p.location ||
+            ""
+          ).toLowerCase() === side
+      ) ||
+      null
     );
   }
 
-  function nameFromFixture(fixture, side) {
-    const participants =
-      fixture.participants || [];
+  function teamId(fixture, side) {
+    const p = participant(fixture, side);
 
-    const item =
-      participants.find(
-        x =>
-          String(
-            x.meta?.location || ""
-          ).toLowerCase() === side
-      ) ||
-      participants.find(
-        x =>
-          String(
-            x.location || ""
-          ).toLowerCase() === side
-      );
+    return (
+      p?.id ||
+      p?.team_id ||
+      p?.participant_id ||
+      null
+    );
+  }
 
-    if (item?.name) {
-      return item.name;
-    }
+  function teamName(fixture, side) {
+    const p = participant(fixture, side);
 
-    const parts =
-      String(fixture.name || "")
-        .split(" vs ");
+    if (p?.name) return p.name;
+
+    const parts = String(
+      fixture.name || ""
+    ).split(" vs ");
 
     return (
       side === "home"
@@ -186,18 +112,63 @@ export default async function handler(req, res) {
     ) || side;
   }
 
-  function fixtureToRow(fixture, teamId) {
-    const homeId =
-      teamIdFromFixture(fixture, "home");
+  function statNumber(stat) {
+    const raw =
+      stat?.data?.value ??
+      stat?.value ??
+      stat?.data;
 
-    const awayId =
-      teamIdFromFixture(fixture, "away");
+    const number = Number(raw);
 
-    const stats =
-      fixture.statistics || [];
+    return Number.isFinite(number)
+      ? number
+      : 0;
+  }
+
+  function findStat(stats, names, location) {
+    const wanted = names.map(x =>
+      x.toLowerCase()
+    );
+
+    const found = (stats || []).find(stat => {
+      const typeName = String(
+        stat.type?.name ||
+        stat.type?.developer_name ||
+        stat.type ||
+        ""
+      ).toLowerCase();
+
+      if (
+        !wanted.some(name =>
+          typeName.includes(name)
+        )
+      ) {
+        return false;
+      }
+
+      const statLocation = String(
+        stat.location ||
+        stat.meta?.location ||
+        ""
+      ).toLowerCase();
+
+      return !location ||
+        statLocation === location;
+    });
+
+    return found
+      ? statNumber(found)
+      : 0;
+  }
+
+  function convertFixture(fixture, wantedTeamId) {
+    const homeId = teamId(
+      fixture,
+      "home"
+    );
 
     const side =
-      String(homeId) === String(teamId)
+      String(homeId) === String(wantedTeamId)
         ? "home"
         : "away";
 
@@ -206,22 +177,25 @@ export default async function handler(req, res) {
         ? "away"
         : "home";
 
+    const stats =
+      fixture.statistics || [];
+
     return {
       date: fixture.starting_at,
 
-      shots: statValue(
+      shots: findStat(
         stats,
         ["shots"],
         side
       ),
 
-      shotsAgainst: statValue(
+      shotsAgainst: findStat(
         stats,
         ["shots"],
         opponent
       ),
 
-      sot: statValue(
+      sot: findStat(
         stats,
         [
           "shots on target",
@@ -230,7 +204,7 @@ export default async function handler(req, res) {
         side
       ),
 
-      sotAgainst: statValue(
+      sotAgainst: findStat(
         stats,
         [
           "shots on target",
@@ -239,25 +213,25 @@ export default async function handler(req, res) {
         opponent
       ),
 
-      corners: statValue(
+      corners: findStat(
         stats,
         ["corners"],
         side
       ),
 
-      cornersAgainst: statValue(
+      cornersAgainst: findStat(
         stats,
         ["corners"],
         opponent
       ),
 
-      poss: statValue(
+      poss: findStat(
         stats,
         ["possession"],
         side
       ),
 
-      attacks: statValue(
+      attacks: findStat(
         stats,
         [
           "attacks",
@@ -266,7 +240,7 @@ export default async function handler(req, res) {
         side
       ),
 
-      crosses: statValue(
+      crosses: findStat(
         stats,
         ["crosses"],
         side
@@ -274,30 +248,42 @@ export default async function handler(req, res) {
     };
   }
 
+  function average(values) {
+    const valid = values.filter(
+      x => Number.isFinite(x)
+    );
+
+    if (!valid.length) return 0;
+
+    return (
+      valid.reduce(
+        (a, b) => a + b,
+        0
+      ) / valid.length
+    );
+  }
+
   function weighted(values) {
-    const valid =
-      values.filter(
-        x => Number.isFinite(x)
-      );
+    const valid = values.filter(
+      x => Number.isFinite(x)
+    );
 
-    if (!valid.length) {
-      return 0;
-    }
+    if (!valid.length) return 0;
 
-    let sum = 0;
-    let weight = 0;
+    let total = 0;
+    let weights = 0;
 
     valid
       .slice(-20)
       .forEach((value, index) => {
-        const w = index + 1;
+        const weight = index + 1;
 
-        sum += value * w;
-        weight += w;
+        total += value * weight;
+        weights += weight;
       });
 
-    return weight
-      ? sum / weight
+    return weights
+      ? total / weights
       : 0;
   }
 
@@ -343,19 +329,25 @@ export default async function handler(req, res) {
     };
   }
 
-  function adjust(team, opponent, market) {
-    const pos =
+  function adjustment(team, opponent, market) {
+    const possession =
       (team.poss || 50) -
       (opponent.poss || 50);
 
     const pressure =
-      (team.attacks /
-        (opponent.attacks || 1)) -
+      (team.attacks || 0) /
+      Math.max(
+        opponent.attacks || 1,
+        1
+      ) -
       1;
 
     const width =
-      (team.crosses /
-        (opponent.crosses || 1)) -
+      (team.crosses || 0) /
+      Math.max(
+        opponent.crosses || 1,
+        1
+      ) -
       1;
 
     if (market === "corners") {
@@ -363,7 +355,7 @@ export default async function handler(req, res) {
         -1.2,
         Math.min(
           1.2,
-          pos * 0.006 +
+          possession * 0.006 +
           pressure * 0.7 +
           width * 0.35
         )
@@ -375,7 +367,7 @@ export default async function handler(req, res) {
         -1.5,
         Math.min(
           1.5,
-          pos * 0.004 +
+          possession * 0.004 +
           pressure * 0.8
         )
       );
@@ -385,16 +377,14 @@ export default async function handler(req, res) {
       -1,
       Math.min(
         1,
-        pos * 0.003 +
+        possession * 0.003 +
         pressure * 0.5
       )
     );
   }
 
   function erf(x) {
-    const sign =
-      x < 0 ? -1 : 1;
-
+    const sign = x < 0 ? -1 : 1;
     const a = Math.abs(x);
 
     const t =
@@ -403,7 +393,8 @@ export default async function handler(req, res) {
 
     return sign * (
       1 -
-      ((((1.061405429 * t - 1.453152027) * t +
+      ((((1.061405429 * t -
+        1.453152027) * t +
         1.421413741) * t -
         0.284496736) * t +
         0.254829592) *
@@ -412,18 +403,24 @@ export default async function handler(req, res) {
     );
   }
 
-  function cdf(z) {
-    return 0.5 *
-      (1 + erf(z / Math.sqrt(2)));
+  function normalCDF(z) {
+    return (
+      0.5 *
+      (1 + erf(z / Math.sqrt(2)))
+    );
   }
 
-  function over(mean, line, sd) {
+  function overProbability(
+    mean,
+    line,
+    sd
+  ) {
     return Math.max(
       0.01,
       Math.min(
         0.99,
         1 -
-          cdf(
+          normalCDF(
             (line - mean) /
             Math.max(sd, 1)
           )
@@ -431,7 +428,11 @@ export default async function handler(req, res) {
     );
   }
 
-  function predict(fixture, homeHistory, awayHistory) {
+  function predict(
+    fixture,
+    homeHistory,
+    awayHistory
+  ) {
     const home =
       profile(homeHistory);
 
@@ -441,12 +442,20 @@ export default async function handler(req, res) {
     const homeShots =
       home.shots * 0.55 +
       away.shotsAgainst * 0.45 +
-      adjust(home, away, "shots");
+      adjustment(
+        home,
+        away,
+        "shots"
+      );
 
     const awayShots =
       away.shots * 0.55 +
       home.shotsAgainst * 0.45 +
-      adjust(away, home, "shots");
+      adjustment(
+        away,
+        home,
+        "shots"
+      );
 
     const homeSOT =
       home.sot * 0.55 +
@@ -459,12 +468,20 @@ export default async function handler(req, res) {
     const homeCorners =
       home.corners * 0.55 +
       away.cornersAgainst * 0.45 +
-      adjust(home, away, "corners");
+      adjustment(
+        home,
+        away,
+        "corners"
+      );
 
     const awayCorners =
       away.corners * 0.55 +
       home.cornersAgainst * 0.45 +
-      adjust(away, home, "corners");
+      adjustment(
+        away,
+        home,
+        "corners"
+      );
 
     const lines = [
       [
@@ -549,19 +566,22 @@ export default async function handler(req, res) {
                 mean * 0.24
               );
 
-        const p =
-          over(mean, line, sd);
-
-        const score =
-          Math.round(
-            Math.max(
-              1,
-              Math.min(
-                95,
-                p * 100
-              )
-            )
+        const probability =
+          overProbability(
+            mean,
+            line,
+            sd
           );
+
+        const score = Math.round(
+          Math.max(
+            1,
+            Math.min(
+              95,
+              probability * 100
+            )
+          )
+        );
 
         const grade =
           score >= 80
@@ -578,14 +598,14 @@ export default async function handler(req, res) {
 
           league:
             fixture.league?.name ||
-            fixture.league ||
             "Football",
 
           market,
           name,
           mean,
           line,
-          p,
+
+          p: probability,
           score,
           grade,
 
@@ -596,10 +616,7 @@ export default async function handler(req, res) {
             ),
 
           why:
-            `Weighted last-${Math.min(
-              Math.min(home.n, away.n),
-              20
-            )} matches, opponent concession and style pressure.`
+            `Weighted historical data from up to 20 previous matches, opponent concessions and playing style.`
         };
       }
     );
@@ -607,13 +624,13 @@ export default async function handler(req, res) {
 
   try {
     /*
-      STEP 1
-      Get today's fixtures.
+      First try the date selected
+      by the user.
     */
 
-    const fixtureJson =
+    let fixtureData =
       await get(
-        `/fixtures/date/${date}`,
+        `/fixtures/date/${requestedDate}`,
         {
           include:
             "participants;league",
@@ -621,36 +638,99 @@ export default async function handler(req, res) {
         }
       );
 
-    const fixtures =
-      fixtureJson.data || [];
+    let fixtures =
+      fixtureData.data || [];
 
     /*
-      Limit the scan so a Vercel request
-      doesn't make too many API calls.
+      If there are no fixtures on the
+      selected date, check the next
+      three dates.
+
+      This prevents the dashboard from
+      appearing broken on quiet football
+      days.
+    */
+
+    if (!fixtures.length) {
+      for (let i = 1; i <= 3; i++) {
+        const nextDate =
+          new Date(
+            `${requestedDate}T12:00:00Z`
+          );
+
+        nextDate.setUTCDate(
+          nextDate.getUTCDate() + i
+        );
+
+        const dateString =
+          nextDate
+            .toISOString()
+            .slice(0, 10);
+
+        const nextData =
+          await get(
+            `/fixtures/date/${dateString}`,
+            {
+              include:
+                "participants;league",
+              per_page: 50
+            }
+          );
+
+        if (
+          (nextData.data || []).length
+        ) {
+          fixtures =
+            nextData.data;
+
+          break;
+        }
+      }
+    }
+
+    /*
+      Do not make hundreds of API calls.
     */
 
     const selectedFixtures =
       fixtures
-        .filter(f => f && f.participants)
+        .filter(
+          fixture =>
+            fixture &&
+            fixture.participants
+        )
         .slice(0, 12);
+
+    /*
+      If SportMonks genuinely returned
+      no fixtures, tell the frontend
+      exactly that.
+    */
+
+    if (!selectedFixtures.length) {
+      return res.status(200).json({
+        date: requestedDate,
+        fixtures: 0,
+        rows: [],
+        message:
+          "SportMonks returned no fixtures for the selected date or the following three days."
+      });
+    }
 
     const rows = [];
 
-    /*
-      STEP 2
-      Get approximately six months
-      of history for each team.
-    */
-
-    for (const fixture of selectedFixtures) {
+    for (
+      const fixture
+      of selectedFixtures
+    ) {
       const homeId =
-        teamIdFromFixture(
+        teamId(
           fixture,
           "home"
         );
 
       const awayId =
-        teamIdFromFixture(
+        teamId(
           fixture,
           "away"
         );
@@ -659,30 +739,34 @@ export default async function handler(req, res) {
         continue;
       }
 
-      const start =
+      const fixtureTime =
         new Date(
-          new Date(
-            fixture.starting_at
-          ).getTime() -
-          1000 *
-          60 *
-          60 *
+          fixture.starting_at
+        );
+
+      const startDate =
+        new Date(
+          fixtureTime.getTime() -
+          180 *
           24 *
-          180
+          60 *
+          60 *
+          1000
         )
           .toISOString()
           .slice(0, 10);
 
-      /*
-        Get both teams at the same time.
-      */
+      const endDate =
+        fixtureTime
+          .toISOString()
+          .slice(0, 10);
 
       const [
-        homeJson,
-        awayJson
+        homeData,
+        awayData
       ] = await Promise.all([
         get(
-          `/fixtures/between/${start}/${date}/${homeId}`,
+          `/fixtures/between/${startDate}/${endDate}/${homeId}`,
           {
             include:
               "participants;statistics.type",
@@ -692,7 +776,7 @@ export default async function handler(req, res) {
         ),
 
         get(
-          `/fixtures/between/${start}/${date}/${awayId}`,
+          `/fixtures/between/${startDate}/${endDate}/${awayId}`,
           {
             include:
               "participants;statistics.type",
@@ -702,59 +786,57 @@ export default async function handler(req, res) {
         )
       ]);
 
-      const fixtureDate =
-        new Date(
-          fixture.starting_at
-        );
-
       const homeHistory =
-        (homeJson.data || [])
+        (homeData.data || [])
           .filter(
             item =>
               new Date(
                 item.starting_at
-              ) < fixtureDate
+              ) < fixtureTime
           )
           .sort(
             (a, b) =>
-              new Date(a.starting_at) -
-              new Date(b.starting_at)
+              new Date(
+                a.starting_at
+              ) -
+              new Date(
+                b.starting_at
+              )
           )
           .slice(-20)
           .map(
             item =>
-              fixtureToRow(
+              convertFixture(
                 item,
                 homeId
               )
           );
 
       const awayHistory =
-        (awayJson.data || [])
+        (awayData.data || [])
           .filter(
             item =>
               new Date(
                 item.starting_at
-              ) < fixtureDate
+              ) < fixtureTime
           )
           .sort(
             (a, b) =>
-              new Date(a.starting_at) -
-              new Date(b.starting_at)
+              new Date(
+                a.starting_at
+              ) -
+              new Date(
+                b.starting_at
+              )
           )
           .slice(-20)
           .map(
             item =>
-              fixtureToRow(
+              convertFixture(
                 item,
                 awayId
               )
           );
-
-      /*
-        We need some historical data
-        before producing predictions.
-      */
 
       if (
         !homeHistory.length ||
@@ -767,13 +849,13 @@ export default async function handler(req, res) {
         ...predict(
           {
             home:
-              nameFromFixture(
+              teamName(
                 fixture,
                 "home"
               ),
 
             away:
-              nameFromFixture(
+              teamName(
                 fixture,
                 "away"
               ),
@@ -789,21 +871,22 @@ export default async function handler(req, res) {
     }
 
     return res.status(200).json({
-      date,
-      fixtures: selectedFixtures.length,
+      date: requestedDate,
+      fixtures:
+        selectedFixtures.length,
       rows
     });
 
   } catch (error) {
     console.error(
-      "SportMonks scan error:",
+      "SportMonks error:",
       error
     );
 
     return res.status(500).json({
       error:
-        error?.message ||
-        "Unknown SportMonks API error"
+        error.message ||
+        "SportMonks API request failed."
     });
   }
 }
