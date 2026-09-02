@@ -1,1242 +1,801 @@
 /*
- Fixture Intelligence — Broad Fixture Scanner
+  Fixture Intelligence — Broad Daily Fixture Scanner
+  Version 2.1
 
- Required Vercel Environment Variable:
-   API_FOOTBALL_KEY
+  API:
+  API-Football / API-Sports
 
- API-Football provides the broader daily fixture calendar and
- historical match statistics. Sportmonks remains available for
- future enrichment/odds work.
+  Required Vercel Environment Variable:
+  API_FOOTBALL_KEY
+
+  Purpose:
+  - Pull the complete fixture slate for a selected date
+  - Use Africa/Lagos timezone
+  - Do NOT artificially limit the number of discovered fixtures
+  - Keep deep historical analysis controlled to protect API quota
 */
 
-export default async function handler(req, res) {
-  const apiKey = process.env.API_FOOTBALL_KEY;
+const API_BASE = "https://v3.football.api-sports.io";
+const TIMEZONE = "Africa/Lagos";
 
-  if (!apiKey) {
-    return res.status(500).json({
-      error: "API_FOOTBALL_KEY is not configured in Vercel.",
-      setup: "Add API_FOOTBALL_KEY to the Production environment and redeploy."
-    });
+/* -------------------------------------------------------
+   Helpers
+------------------------------------------------------- */
+
+function todayLagos() {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date());
+
+  const get = (type) => parts.find(p => p.type === type)?.value;
+
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+function safeNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function average(values) {
+  const valid = values
+    .map(Number)
+    .filter(Number.isFinite);
+
+  if (!valid.length) return 0;
+
+  return valid.reduce((a, b) => a + b, 0) / valid.length;
+}
+
+/* -------------------------------------------------------
+   API request
+------------------------------------------------------- */
+
+async function apiRequest(endpoint, apiKey) {
+  const response = await fetch(`${API_BASE}${endpoint}`, {
+    method: "GET",
+    headers: {
+      "x-apisports-key": apiKey,
+      "Accept": "application/json"
+    }
+  });
+
+  let data = null;
+
+  try {
+    data = await response.json();
+  } catch {
+    throw new Error(`API returned invalid JSON (${response.status})`);
   }
 
-  const date = String(
-    req.query?.date || new Date().toISOString().slice(0, 10)
-  );
+  if (!response.ok) {
+    const message =
+      data?.errors?.message ||
+      data?.message ||
+      `API request failed with status ${response.status}`;
 
-  const API = "https://v3.football.api-sports.io";
-  const headers = { "x-apisports-key": apiKey };
-
-  async function api(path, params = {}) {
-    const url = new URL(API + path);
-
-    for (const [key, value] of Object.entries(params)) {
-      if (value !== undefined && value !== null && value !== "") {
-        url.searchParams.set(key, String(value));
-      }
-    }
-
-    const response = await fetch(url.toString(), { headers });
-    const text = await response.text();
-
-    let json;
-
-    try {
-      json = JSON.parse(text);
-    } catch {
-      throw new Error(
-        `API-Football returned invalid JSON (${response.status})`
-      );
-    }
-
-    if (!response.ok || (json.errors && Object.keys(json.errors).length)) {
-      throw new Error(
-        `API-Football error ${response.status}: ${
-          typeof json.errors === "object"
-            ? JSON.stringify(json.errors)
-            : String(json.errors || "Unknown error")
-        }`
-      );
-    }
-
-    return json;
+    throw new Error(message);
   }
 
-  const num = value => {
-    if (typeof value === "string") {
-      const n = Number(value.replace("%", "").trim());
-      return Number.isFinite(n) ? n : 0;
-    }
+  if (data?.errors && Object.keys(data.errors).length) {
+    throw new Error(
+      typeof data.errors === "string"
+        ? data.errors
+        : JSON.stringify(data.errors)
+    );
+  }
 
-    const n = Number(value);
-    return Number.isFinite(n) ? n : 0;
+  return data;
+}
+
+/* -------------------------------------------------------
+   Fixture retrieval
+------------------------------------------------------- */
+
+async function getDailyFixtures(date, apiKey) {
+  const endpoint =
+    `/fixtures?date=${encodeURIComponent(date)}` +
+    `&timezone=${encodeURIComponent(TIMEZONE)}`;
+
+  const data = await apiRequest(endpoint, apiKey);
+
+  const fixtures = Array.isArray(data.response)
+    ? data.response
+    : [];
+
+  /*
+    API-Football normally returns the date query as one response,
+    but we still inspect paging so that a future pagination response
+    doesn't silently truncate our fixture list.
+  */
+
+  const paging = data.paging || {
+    current: 1,
+    total: 1
   };
 
-  function statValue(statistics, names) {
-    const wanted = names.map(x => x.toLowerCase());
+  let allFixtures = [...fixtures];
 
-    const item = (statistics || []).find(
-      s => wanted.includes(String(s.type || "").toLowerCase())
-    );
+  const current = safeNumber(paging.current, 1);
+  const total = safeNumber(paging.total, 1);
 
-    return num(item?.value);
-  }
+  if (total > current) {
+    for (let page = current + 1; page <= total; page++) {
+      const pageEndpoint =
+        `/fixtures?date=${encodeURIComponent(date)}` +
+        `&timezone=${encodeURIComponent(TIMEZONE)}` +
+        `&page=${page}`;
 
-  function extractTeamStats(statistics, teamId) {
-    const block = (statistics || []).find(
-      s => Number(s.team?.id) === Number(teamId)
-    );
+      const pageData = await apiRequest(pageEndpoint, apiKey);
 
-    const rows = block?.statistics || [];
-
-    return {
-      shots: statValue(rows, ["Total Shots"]),
-      sot: statValue(rows, ["Shots on Goal"]),
-      corners: statValue(rows, ["Corner Kicks"]),
-      possession: statValue(rows, ["Ball Possession"]),
-      attacks: statValue(rows, ["Attacks"]),
-      dangerousAttacks: statValue(rows, ["Dangerous Attacks"]),
-      crosses: statValue(rows, ["Crosses"])
-    };
-  }
-
-  function scoreFor(fixture, teamId) {
-    const side =
-      Number(fixture.teams?.home?.id) === Number(teamId)
-        ? "home"
-        : "away";
-
-    return num(fixture.goals?.[side]);
-  }
-
-  function toHistoryRecord(fixture, teamId) {
-    const homeId = fixture.teams?.home?.id;
-    const awayId = fixture.teams?.away?.id;
-    const isHome = Number(homeId) === Number(teamId);
-
-    const own = extractTeamStats(fixture.statistics, teamId);
-
-    const opponent = extractTeamStats(
-      fixture.statistics,
-      isHome ? awayId : homeId
-    );
-
-    return {
-      date: fixture.fixture?.date,
-      shots: own.shots,
-      shotsAgainst: opponent.shots,
-      sot: own.sot,
-      sotAgainst: opponent.sot,
-      corners: own.corners,
-      cornersAgainst: opponent.corners,
-      goals: scoreFor(fixture, teamId),
-      goalsAgainst: scoreFor(
-        fixture,
-        isHome ? awayId : homeId
-      ),
-      poss: own.possession,
-      attacks: own.attacks || own.dangerousAttacks,
-      crosses: own.crosses,
-      home: isHome
-    };
-  }
-
-  function weighted(values) {
-    const clean = values.filter(v => Number.isFinite(v));
-
-    if (!clean.length) return 0;
-
-    let sum = 0;
-    let weight = 0;
-
-    clean.forEach((value, index) => {
-      const w = index + 1;
-      sum += value * w;
-      weight += w;
-    });
-
-    return sum / weight;
-  }
-
-  function profile(history) {
-    const last20 = history
-      .filter(Boolean)
-      .sort(
-        (a, b) =>
-          new Date(a.date) - new Date(b.date)
-      )
-      .slice(-20);
-
-    return {
-      shots: weighted(last20.map(x => x.shots)),
-      shotsAgainst: weighted(last20.map(x => x.shotsAgainst)),
-
-      sot: weighted(last20.map(x => x.sot)),
-      sotAgainst: weighted(last20.map(x => x.sotAgainst)),
-
-      corners: weighted(last20.map(x => x.corners)),
-      cornersAgainst: weighted(
-        last20.map(x => x.cornersAgainst)
-      ),
-
-      goals: weighted(last20.map(x => x.goals)),
-      goalsAgainst: weighted(
-        last20.map(x => x.goalsAgainst)
-      ),
-
-      poss: weighted(last20.map(x => x.poss)),
-      attacks: weighted(last20.map(x => x.attacks)),
-      crosses: weighted(last20.map(x => x.crosses)),
-
-      n: last20.length,
-
-      homeN: last20.filter(x => x.home).length,
-      awayN: last20.filter(x => !x.home).length
-    };
-  }
-
-  function clamp(value, min, max) {
-    return Math.max(min, Math.min(max, value));
+      if (Array.isArray(pageData.response)) {
+        allFixtures.push(...pageData.response);
+      }
+    }
   }
 
   /*
-   Style matchup:
-   possession + attacking volume + crossing pressure.
+    Remove accidental duplicate fixture IDs.
   */
 
-  function styleAdjustment(team, opponent, market) {
-    const possessionDiff =
-      (team.poss || 50) -
-      (opponent.poss || 50);
+  const unique = [];
+  const seen = new Set();
 
-    const attackRatio =
-      (team.attacks || 90) /
-        Math.max(opponent.attacks || 90, 1) -
-      1;
+  for (const fixture of allFixtures) {
+    const id = fixture?.fixture?.id;
 
-    const crossingRatio =
-      (team.crosses || 15) /
-        Math.max(opponent.crosses || 15, 1) -
-      1;
+    if (!id) continue;
 
-    if (market === "corners") {
-      return clamp(
-        possessionDiff * 0.006 +
-          attackRatio * 0.7 +
-          crossingRatio * 0.35,
-        -1.2,
-        1.2
-      );
+    if (!seen.has(id)) {
+      seen.add(id);
+      unique.push(fixture);
     }
+  }
 
-    if (market === "shots") {
-      return clamp(
-        possessionDiff * 0.004 +
-          attackRatio * 0.8,
-        -1.5,
-        1.5
-      );
+  /*
+    Only upcoming / relevant matches for prediction.
+    Finished matches are not prediction opportunities.
+  */
+
+  const predictionStatuses = new Set([
+    "NS",
+    "TBD",
+    "PST"
+  ]);
+
+  const upcoming = unique.filter(item => {
+    const status = item?.fixture?.status?.short;
+    return predictionStatuses.has(status);
+  });
+
+  /*
+    If filtering somehow produces nothing, return the complete
+    fixture set rather than falsely reporting zero fixtures.
+  */
+
+  return {
+    all: unique,
+    upcoming: upcoming.length ? upcoming : unique,
+    paging: {
+      current,
+      total
     }
+  };
+}
 
-    if (market === "sot") {
-      return clamp(
-        possessionDiff * 0.003 +
-          attackRatio * 0.5,
-        -1,
-        1
-      );
-    }
+/* -------------------------------------------------------
+   Last matches
+------------------------------------------------------- */
 
-    return 0;
+async function getTeamHistory(teamId, apiKey) {
+  if (!teamId) return [];
+
+  const endpoint =
+    `/fixtures?team=${teamId}` +
+    `&last=20` +
+    `&timezone=${encodeURIComponent(TIMEZONE)}`;
+
+  const data = await apiRequest(endpoint, apiKey);
+
+  return Array.isArray(data.response)
+    ? data.response
+    : [];
+}
+
+/* -------------------------------------------------------
+   Extract match statistics
+------------------------------------------------------- */
+
+function getTeamFromFixture(fixture, teamId) {
+  if (!fixture?.teams) return null;
+
+  if (fixture.teams.home?.id === teamId) {
+    return fixture.teams.home;
   }
 
-  function erf(x) {
-    const sign = x < 0 ? -1 : 1;
-    const a = Math.abs(x);
-    const t = 1 / (1 + 0.3275911 * a);
-
-    const y =
-      1 -
-      (((((1.061405429 * t - 1.453152027) * t) +
-        1.421413741) * t -
-        0.284496736) * t +
-        0.254829592) *
-        t *
-        Math.exp(-a * a);
-
-    return sign * y;
+  if (fixture.teams.away?.id === teamId) {
+    return fixture.teams.away;
   }
 
-  function normalCdf(z) {
-    return 0.5 * (1 + erf(z / Math.sqrt(2)));
-  }
+  return null;
+}
 
-  function overProbability(mean, line, sd) {
-    return clamp(
-      1 -
-        normalCdf(
-          (line - mean) /
-            Math.max(sd, 0.5)
-        ),
-      0.01,
-      0.99
-    );
-  }
+function extractTeamHistoryStats(history, teamId) {
+  const matches = [];
 
-  function grade(score) {
-    if (score >= 80) return "strong";
-    if (score >= 70) return "value";
-    if (score >= 62) return "watch";
+  for (const match of history) {
+    const home = match?.teams?.home;
+    const away = match?.teams?.away;
 
-    return "avoid";
-  }
+    if (!home || !away) continue;
 
-  function addMarket(
-    rows,
-    meta,
-    group,
-    name,
-    mean,
-    line,
-    sd,
-    quality
-  ) {
-    const probability =
-      overProbability(
-        mean,
-        line,
-        sd
-      );
+    const isHome = home.id === teamId;
+    const isAway = away.id === teamId;
 
-    const confidence =
-      Math.round(
-        clamp(
-          probability * 100 * quality,
-          1,
-          95
-        )
-      );
+    if (!isHome && !isAway) continue;
 
-    rows.push({
-      ...meta,
+    const team = isHome ? home : away;
+    const opponent = isHome ? away : home;
 
-      group,
-      name,
+    const goalsFor = isHome
+      ? safeNumber(match?.goals?.home)
+      : safeNumber(match?.goals?.away);
 
-      mean,
-      line,
+    const goalsAgainst = isHome
+      ? safeNumber(match?.goals?.away)
+      : safeNumber(match?.goals?.home);
 
-      probability,
+    matches.push({
+      fixtureId: match?.fixture?.id,
+      date: match?.fixture?.date,
 
-      score: confidence,
-      confidence,
+      homeAway: isHome ? "home" : "away",
 
-      grade: grade(confidence),
+      opponent: opponent?.name || "Unknown",
 
-      quality
+      goalsFor,
+      goalsAgainst
     });
   }
 
-  function makePrediction(
-    fixture,
-    homeHistory,
-    awayHistory
-  ) {
-    const h = profile(homeHistory);
-    const a = profile(awayHistory);
+  return matches.slice(0, 20);
+}
 
-    const home = fixture.teams.home;
-    const away = fixture.teams.away;
+/* -------------------------------------------------------
+   Basic historical model
+------------------------------------------------------- */
 
-    const sample =
-      Math.min(h.n, a.n);
+function buildHistoricalProfile(history, teamId) {
+  const matches = extractTeamHistoryStats(history, teamId);
 
-    const meta = {
-      match:
-        `${home.name} vs ${away.name}`,
-
-      league:
-        fixture.league?.name ||
-        "Football",
-
-      kickoff:
-        fixture.fixture?.date,
-
-      fixtureId:
-        fixture.fixture?.id,
-
-      sample
+  if (!matches.length) {
+    return {
+      sample: 0,
+      goalsFor: 0,
+      goalsAgainst: 0,
+      homeMatches: 0,
+      awayMatches: 0
     };
-
-    const quality =
-      clamp(
-        0.55 +
-          (sample / 20) * 0.30 +
-          (
-            h.homeN >= 5 &&
-            a.awayN >= 5
-              ? 0.10
-              : 0
-          ),
-        0.55,
-        0.95
-      );
-
-    /*
-      SHOTS
-    */
-
-    const homeShots =
-      Math.max(
-        0.2,
-
-        h.shots * 0.55 +
-        a.shotsAgainst * 0.45 +
-
-        styleAdjustment(
-          h,
-          a,
-          "shots"
-        )
-      );
-
-    const awayShots =
-      Math.max(
-        0.2,
-
-        a.shots * 0.55 +
-        h.shotsAgainst * 0.45 +
-
-        styleAdjustment(
-          a,
-          h,
-          "shots"
-        )
-      );
-
-    /*
-      SHOTS ON TARGET
-    */
-
-    const homeSot =
-      Math.max(
-        0.1,
-
-        h.sot * 0.55 +
-        a.sotAgainst * 0.45 +
-
-        styleAdjustment(
-          h,
-          a,
-          "sot"
-        )
-      );
-
-    const awaySot =
-      Math.max(
-        0.1,
-
-        a.sot * 0.55 +
-        h.sotAgainst * 0.45 +
-
-        styleAdjustment(
-          a,
-          h,
-          "sot"
-        )
-      );
-
-    /*
-      CORNERS
-    */
-
-    const homeCorners =
-      Math.max(
-        0.2,
-
-        h.corners * 0.55 +
-        a.cornersAgainst * 0.45 +
-
-        styleAdjustment(
-          h,
-          a,
-          "corners"
-        )
-      );
-
-    const awayCorners =
-      Math.max(
-        0.2,
-
-        a.corners * 0.55 +
-        h.cornersAgainst * 0.45 +
-
-        styleAdjustment(
-          a,
-          h,
-          "corners"
-        )
-      );
-
-    /*
-      GOALS
-    */
-
-    const homeGoals =
-      Math.max(
-        0.05,
-
-        h.goals * 0.55 +
-        a.goalsAgainst * 0.45
-      );
-
-    const awayGoals =
-      Math.max(
-        0.05,
-
-        a.goals * 0.55 +
-        h.goalsAgainst * 0.45
-      );
-
-    const rows = [];
-
-    /*
-      TEAM SHOTS
-    */
-
-    addMarket(
-      rows,
-      meta,
-      "shots",
-
-      `${home.name} shots O10.5`,
-
-      homeShots,
-      10.5,
-
-      Math.max(
-        2.2,
-        homeShots * 0.28
-      ),
-
-      quality
-    );
-
-    addMarket(
-      rows,
-      meta,
-      "shots",
-
-      `${away.name} shots O8.5`,
-
-      awayShots,
-      8.5,
-
-      Math.max(
-        2.2,
-        awayShots * 0.28
-      ),
-
-      quality
-    );
-
-    /*
-      MATCH SHOTS
-    */
-
-    addMarket(
-      rows,
-      meta,
-      "shots",
-
-      "Match shots O24.5",
-
-      homeShots +
-        awayShots,
-
-      24.5,
-
-      Math.max(
-        3.5,
-        (
-          homeShots +
-          awayShots
-        ) * 0.23
-      ),
-
-      quality
-    );
-
-    /*
-      TEAM SOT
-    */
-
-    addMarket(
-      rows,
-      meta,
-      "sot",
-
-      `${home.name} SOT O3.5`,
-
-      homeSot,
-      3.5,
-
-      Math.max(
-        1.1,
-        homeSot * 0.28
-      ),
-
-      quality
-    );
-
-    addMarket(
-      rows,
-      meta,
-      "sot",
-
-      `${away.name} SOT O2.5`,
-
-      awaySot,
-      2.5,
-
-      Math.max(
-        1.1,
-        awaySot * 0.28
-      ),
-
-      quality
-    );
-
-    /*
-      MATCH SOT
-    */
-
-    addMarket(
-      rows,
-      meta,
-      "sot",
-
-      "Match SOT O7.5",
-
-      homeSot +
-        awaySot,
-
-      7.5,
-
-      Math.max(
-        1.5,
-        (
-          homeSot +
-          awaySot
-        ) * 0.24
-      ),
-
-      quality
-    );
-
-    /*
-      TEAM CORNERS
-    */
-
-    addMarket(
-      rows,
-      meta,
-      "corners",
-
-      `${home.name} corners O4.5`,
-
-      homeCorners,
-      4.5,
-
-      Math.max(
-        1.5,
-        homeCorners * 0.27
-      ),
-
-      quality
-    );
-
-    addMarket(
-      rows,
-      meta,
-      "corners",
-
-      `${away.name} corners O3.5`,
-
-      awayCorners,
-      3.5,
-
-      Math.max(
-        1.5,
-        awayCorners * 0.27
-      ),
-
-      quality
-    );
-
-    /*
-      MATCH CORNERS
-    */
-
-    addMarket(
-      rows,
-      meta,
-      "corners",
-
-      "Match corners O8.5",
-
-      homeCorners +
-        awayCorners,
-
-      8.5,
-
-      Math.max(
-        1.8,
-        (
-          homeCorners +
-          awayCorners
-        ) * 0.23
-      ),
-
-      quality
-    );
-
-    /*
-      GOALS
-    */
-
-    addMarket(
-      rows,
-      meta,
-      "goals",
-
-      "Match goals O2.5",
-
-      homeGoals +
-        awayGoals,
-
-      2.5,
-
-      Math.max(
-        0.75,
-        (
-          homeGoals +
-          awayGoals
-        ) * 0.38
-      ),
-
-      quality
-    );
-
-    addMarket(
-      rows,
-      meta,
-      "goals",
-
-      `${home.name} goals O0.5`,
-
-      homeGoals,
-      0.5,
-
-      Math.max(
-        0.55,
-        homeGoals * 0.42
-      ),
-
-      quality
-    );
-
-    addMarket(
-      rows,
-      meta,
-      "goals",
-
-      `${away.name} goals O0.5`,
-
-      awayGoals,
-      0.5,
-
-      Math.max(
-        0.55,
-        awayGoals * 0.42
-      ),
-
-      quality
-    );
-
-    /*
-      MATCH RESULT
-    */
-
-    const homeRaw =
-      clamp(
-        0.50 +
-          (
-            homeGoals -
-            awayGoals
-          ) * 0.16,
-
-        0.12,
-        0.78
-      );
-
-    const awayRaw =
-      clamp(
-        0.50 +
-          (
-            awayGoals -
-            homeGoals
-          ) * 0.16,
-
-        0.12,
-        0.78
-      );
-
-    const drawRaw =
-      clamp(
-        1 -
-          homeRaw -
-          awayRaw +
-          0.18,
-
-        0.10,
-        0.40
-      );
-
-    const total =
-      homeRaw +
-      awayRaw +
-      drawRaw;
-
-    [
-      [
-        `${home.name} to win`,
-        homeRaw / total
-      ],
-
-      [
-        "Draw",
-        drawRaw / total
-      ],
-
-      [
-        `${away.name} to win`,
-        awayRaw / total
-      ]
-
-    ].forEach(
-      ([name, probability]) => {
-
-        const confidence =
-          Math.round(
-            clamp(
-              probability *
-                100 *
-                quality,
-
-              1,
-              95
-            )
-          );
-
-        rows.push({
-          ...meta,
-
-          group: "result",
-
-          name,
-
-          mean:
-            probability,
-
-          line: null,
-
-          probability,
-
-          score:
-            confidence,
-
-          confidence,
-
-          grade:
-            grade(confidence),
-
-          quality
-        });
-      }
-    );
-
-    /*
-      FIRST HALF ESTIMATES
-
-      These are currently estimates from full-match rates.
-      We will replace them with true first-half historical
-      data in the next modelling layer.
-    */
-
-    addMarket(
-      rows,
-      meta,
-      "firsthalf",
-
-      "1H corners O4.5",
-
-      (
-        homeCorners +
-        awayCorners
-      ) * 0.46,
-
-      4.5,
-
-      Math.max(
-        1.4,
-        (
-          homeCorners +
-          awayCorners
-        ) * 0.24
-      ),
-
-      quality * 0.88
-    );
-
-    addMarket(
-      rows,
-      meta,
-      "firsthalf",
-
-      "1H shots O11.5",
-
-      (
-        homeShots +
-        awayShots
-      ) * 0.46,
-
-      11.5,
-
-      Math.max(
-        2.2,
-        (
-          homeShots +
-          awayShots
-        ) * 0.25
-      ),
-
-      quality * 0.88
-    );
-
-    addMarket(
-      rows,
-      meta,
-      "firsthalf",
-
-      "1H SOT O3.5",
-
-      (
-        homeSot +
-        awaySot
-      ) * 0.44,
-
-      3.5,
-
-      Math.max(
-        1.1,
-        (
-          homeSot +
-          awaySot
-        ) * 0.26
-      ),
-
-      quality * 0.88
-    );
-
-    /*
-      EXPLANATIONS
-    */
-
-    rows.forEach(row => {
-
-      if (row.group === "corners") {
-
-        row.why =
-          "Last-20 corner production/concession + possession, attacking pressure and crossing profile.";
-
-      } else if (row.group === "shots") {
-
-        row.why =
-          "Last-20 shots for/against + opponent shot concession + attacking pressure and style.";
-
-      } else if (row.group === "sot") {
-
-        row.why =
-          "Last-20 SOT for/against + opponent SOT concession + attacking pressure and style.";
-
-      } else if (row.group === "goals") {
-
-        row.why =
-          "Last-20 goals for/against + opponent defensive concession.";
-
-      } else if (row.group === "firsthalf") {
-
-        row.why =
-          "Estimated from full-match rates; true first-half historical calibration will be added.";
-
-      } else {
-
-        row.why =
-          "Attacking/defensive profile, opponent concessions and available historical sample.";
-
-      }
-
-    });
-
-    return rows;
   }
 
-  try {
+  return {
+    sample: matches.length,
 
-    /*
-      GET ALL FIXTURES FOR THE DATE
-    */
+    goalsFor: average(
+      matches.map(m => m.goalsFor)
+    ),
 
-    const fixtureResponse =
-      await api(
-        "/fixtures",
-        {
-          date,
-          timezone: "UTC"
-        }
-      );
+    goalsAgainst: average(
+      matches.map(m => m.goalsAgainst)
+    ),
 
-    const fixtures =
-      (
-        fixtureResponse.response ||
-        []
-      )
-      .filter(
-        f =>
-          f.fixture?.status?.short !==
-          "CANC"
-      )
-      .sort(
-        (a, b) =>
-          new Date(
-            a.fixture?.date
-          ) -
-          new Date(
-            b.fixture?.date
-          )
-      );
+    homeMatches: matches.filter(
+      m => m.homeAway === "home"
+    ).length,
 
-    /*
-      We discover ALL fixtures first.
+    awayMatches: matches.filter(
+      m => m.homeAway === "away"
+    ).length
+  };
+}
 
-      Deep analysis is limited to the first 12
-      until we add caching/optimization for the
-      API request quota.
-    */
+/* -------------------------------------------------------
+   Simple projection
+------------------------------------------------------- */
 
-    const analysisFixtures =
-      fixtures.slice(0, 12);
+function buildProjection(homeProfile, awayProfile) {
+  const homeAttack = safeNumber(homeProfile.goalsFor);
+  const awayAttack = safeNumber(awayProfile.goalsFor);
 
-    const historyCache =
-      new Map();
+  const homeDefense = safeNumber(homeProfile.goalsAgainst);
+  const awayDefense = safeNumber(awayProfile.goalsAgainst);
 
-    async function getTeamHistory(teamId) {
+  const homeExpected =
+    (homeAttack + awayDefense) / 2;
 
-      if (
-        historyCache.has(teamId)
-      ) {
-        return historyCache.get(
-          teamId
-        );
-      }
+  const awayExpected =
+    (awayAttack + homeDefense) / 2;
 
-      const response =
-        await api(
-          "/fixtures",
-          {
-            team: teamId,
-            last: 20,
-            status: "FT"
-          }
-        );
+  return {
+    homeGoals: Number(homeExpected.toFixed(2)),
+    awayGoals: Number(awayExpected.toFixed(2)),
+    totalGoals: Number(
+      (homeExpected + awayExpected).toFixed(2)
+    )
+  };
+}
 
-      const list =
-        (
-          response.response ||
-          []
-        )
-        .sort(
-          (a, b) =>
-            new Date(
-              a.fixture?.date
-            ) -
-            new Date(
-              b.fixture?.date
-            )
-        )
-        .slice(-20);
+/* -------------------------------------------------------
+   Market probability helper
+------------------------------------------------------- */
 
-      const detailed = [];
+function overProbability(expected, line) {
+  if (!Number.isFinite(expected)) return 0;
 
-      /*
-        Fetch statistics for historical matches.
-      */
+  /*
+    Lightweight probability approximation.
+    This is intentionally conservative.
+    Later we will replace this with a richer statistical model.
+  */
 
-      for (
-        let i = 0;
-        i < list.length;
-        i += 20
-      ) {
+  const difference = expected - line;
 
-        const ids =
-          list
-          .slice(i, i + 20)
-          .map(
-            x =>
-              x.fixture?.id
-          )
-          .filter(Boolean)
-          .join("-");
+  const probability =
+    50 + difference * 17;
 
-        if (!ids) continue;
+  return Math.round(
+    clamp(probability, 1, 99)
+  );
+}
 
-        const details =
-          await api(
-            "/fixtures",
-            {
-              ids
-            }
-          );
+/* -------------------------------------------------------
+   Create fixture analysis
+------------------------------------------------------- */
 
-        detailed.push(
-          ...(
-            details.response ||
-            []
-          )
-        );
-      }
+function analyseFixture(fixture, homeProfile, awayProfile) {
+  const homeName =
+    fixture?.teams?.home?.name || "Home";
 
-      const records =
-        detailed
-        .filter(
-          x =>
-            Array.isArray(
-              x.statistics
-            )
-        )
-        .map(
-          x =>
-            toHistoryRecord(
-              x,
-              teamId
-            )
-        );
+  const awayName =
+    fixture?.teams?.away?.name || "Away";
 
-      historyCache.set(
-        teamId,
-        records
-      );
+  const projection =
+    buildProjection(homeProfile, awayProfile);
 
-      return records;
+  const totalGoals = projection.totalGoals;
+
+  const markets = [];
+
+  /*
+    Goals
+  */
+
+  markets.push({
+    market: "Match goals O1.5",
+    projection: totalGoals,
+    probability: overProbability(totalGoals, 1.5)
+  });
+
+  markets.push({
+    market: "Match goals O2.5",
+    projection: totalGoals,
+    probability: overProbability(totalGoals, 2.5)
+  });
+
+  /*
+    Team goals
+  */
+
+  markets.push({
+    market: `${homeName} goals O0.5`,
+    projection: projection.homeGoals,
+    probability: overProbability(
+      projection.homeGoals,
+      0.5
+    )
+  });
+
+  markets.push({
+    market: `${awayName} goals O0.5`,
+    projection: projection.awayGoals,
+    probability: overProbability(
+      projection.awayGoals,
+      0.5
+    )
+  });
+
+  /*
+    Give each market a grade.
+  */
+
+  const gradedMarkets = markets.map(item => {
+    let grade = "AVOID";
+
+    if (item.probability >= 75) {
+      grade = "STRONG";
+    } else if (item.probability >= 65) {
+      grade = "VALUE";
+    } else if (item.probability >= 55) {
+      grade = "WATCH";
     }
 
-    const rows = [];
+    return {
+      ...item,
+      confidence: item.probability,
+      grade
+    };
+  });
 
-    let analysed = 0;
-    let insufficient = 0;
+  return {
+    fixtureId: fixture?.fixture?.id,
 
-    for (
-      const fixture of
-      analysisFixtures
-    ) {
+    match: `${homeName} vs ${awayName}`,
 
+    league:
+      fixture?.league?.name || "Unknown competition",
+
+    country:
+      fixture?.league?.country || "",
+
+    kickoff:
+      fixture?.fixture?.date || null,
+
+    teams: {
+      home: {
+        id: fixture?.teams?.home?.id,
+        name: homeName
+      },
+      away: {
+        id: fixture?.teams?.away?.id,
+        name: awayName
+      }
+    },
+
+    historical: {
+      home: homeProfile,
+      away: awayProfile
+    },
+
+    projection,
+
+    markets: gradedMarkets
+  };
+}
+
+/* -------------------------------------------------------
+   Main handler
+------------------------------------------------------- */
+
+export default async function handler(req, res) {
+  try {
+    const apiKey = process.env.API_FOOTBALL_KEY;
+
+    if (!apiKey) {
+      return res.status(500).json({
+        ok: false,
+        error: "API_FOOTBALL_KEY is not configured.",
+        setup:
+          "Add API_FOOTBALL_KEY to the Vercel Production environment."
+      });
+    }
+
+    /*
+      Allow frontend to request a specific date.
+
+      Example:
+      /api/scan?date=2026-09-02
+
+      If no date is supplied, use today's Lagos date.
+    */
+
+    const requestedDate =
+      typeof req.query?.date === "string" &&
+      /^\d{4}-\d{2}-\d{2}$/.test(req.query.date)
+        ? req.query.date
+        : todayLagos();
+
+    /*
+      STEP 1:
+      Get the complete fixture slate.
+    */
+
+    const fixtureData =
+      await getDailyFixtures(
+        requestedDate,
+        apiKey
+      );
+
+    const fixtures = fixtureData.upcoming;
+
+    /*
+      STEP 2:
+      Deduplicate team IDs.
+
+      This prevents repeated history calls when a team appears
+      in only one fixture.
+    */
+
+    const teamIds = new Set();
+
+    for (const fixture of fixtures) {
+      const homeId = fixture?.teams?.home?.id;
+      const awayId = fixture?.teams?.away?.id;
+
+      if (homeId) teamIds.add(homeId);
+      if (awayId) teamIds.add(awayId);
+    }
+
+    /*
+      STEP 3:
+      Historical data.
+
+      IMPORTANT:
+      We deliberately cap the number of teams deeply analysed.
+
+      This protects the free API quota.
+
+      The scanner still discovers ALL fixtures.
+      Later we will create a smarter pre-filter so the model
+      chooses the most promising fixtures before spending
+      historical/statistics requests.
+    */
+
+    const MAX_DEEP_TEAMS = 12;
+
+    const selectedTeamIds =
+      Array.from(teamIds).slice(0, MAX_DEEP_TEAMS);
+
+    const historyMap = new Map();
+
+    for (const teamId of selectedTeamIds) {
+      try {
+        const history =
+          await getTeamHistory(
+            teamId,
+            apiKey
+          );
+
+        historyMap.set(teamId, history);
+      } catch (error) {
+        console.error(
+          `History error for team ${teamId}:`,
+          error.message
+        );
+
+        historyMap.set(teamId, []);
+      }
+    }
+
+    /*
+      STEP 4:
+      Analyse fixtures for which historical data exists.
+
+      Fixtures without historical data are still returned,
+      but marked as requiring deeper analysis.
+    */
+
+    const analyses = [];
+
+    for (const fixture of fixtures) {
       const homeId =
-        fixture.teams?.home?.id;
+        fixture?.teams?.home?.id;
 
       const awayId =
-        fixture.teams?.away?.id;
+        fixture?.teams?.away?.id;
 
-      if (
-        !homeId ||
-        !awayId
-      ) {
-        insufficient++;
-        continue;
-      }
+      const homeHistory =
+        historyMap.get(homeId) || [];
 
-      const [
-        homeHistory,
-        awayHistory
-      ] =
-        await Promise.all([
-          getTeamHistory(
-            homeId
-          ),
+      const awayHistory =
+        historyMap.get(awayId) || [];
 
-          getTeamHistory(
-            awayId
-          )
-        ]);
-
-      if (
-        homeHistory.length < 5 ||
-        awayHistory.length < 5
-      ) {
-        insufficient++;
-        continue;
-      }
-
-      rows.push(
-        ...makePrediction(
-          fixture,
+      const homeProfile =
+        buildHistoricalProfile(
           homeHistory,
-          awayHistory
-        )
-      );
+          homeId
+        );
 
-      analysed++;
+      const awayProfile =
+        buildHistoricalProfile(
+          awayHistory,
+          awayId
+        );
+
+      /*
+        Only produce a model projection when we have
+        at least some historical information.
+      */
+
+      if (
+        homeProfile.sample > 0 &&
+        awayProfile.sample > 0
+      ) {
+        analyses.push(
+          analyseFixture(
+            fixture,
+            homeProfile,
+            awayProfile
+          )
+        );
+      } else {
+        analyses.push({
+          fixtureId: fixture?.fixture?.id,
+
+          match:
+            `${fixture?.teams?.home?.name || "Home"} vs ` +
+            `${fixture?.teams?.away?.name || "Away"}`,
+
+          league:
+            fixture?.league?.name || "Unknown competition",
+
+          country:
+            fixture?.league?.country || "",
+
+          kickoff:
+            fixture?.fixture?.date || null,
+
+          teams: fixture?.teams,
+
+          grade: "WATCH",
+
+          markets: [],
+
+          historical: {
+            home: homeProfile,
+            away: awayProfile
+          },
+
+          message:
+            "Fixture discovered. Waiting for deeper historical analysis."
+        });
+      }
     }
 
     /*
-      IMPORTANT:
-      fixtures = ALL fixtures discovered today
-      analysed = fixtures actually modelled
-      insufficient = fixtures without enough data
+      STEP 5:
+      Flatten markets for the frontend.
+
+      This keeps compatibility with the existing dashboard.
+    */
+
+    const opportunities = [];
+
+    for (const analysis of analyses) {
+      for (const market of analysis.markets || []) {
+        opportunities.push({
+          fixtureId: analysis.fixtureId,
+
+          match: analysis.match,
+
+          league: analysis.league,
+
+          country: analysis.country,
+
+          kickoff: analysis.kickoff,
+
+          market: market.market,
+
+          projection: market.projection,
+
+          probability: market.probability,
+
+          confidence: market.confidence,
+
+          grade: market.grade,
+
+          sample:
+            Math.min(
+              analysis.historical?.home?.sample || 0,
+              analysis.historical?.away?.sample || 0
+            ),
+
+          reason:
+            "Weighted historical data from available previous matches."
+        });
+      }
+    }
+
+    /*
+      Highest confidence first.
+    */
+
+    opportunities.sort(
+      (a, b) =>
+        safeNumber(b.confidence) -
+        safeNumber(a.confidence)
+    );
+
+    const confidenceValues =
+      opportunities
+        .map(o => safeNumber(o.confidence))
+        .filter(v => v > 0);
+
+    const averageConfidence =
+      confidenceValues.length
+        ? Math.round(
+            average(confidenceValues)
+          )
+        : 0;
+
+    const strongSignals =
+      opportunities.filter(
+        o => o.grade === "STRONG"
+      ).length;
+
+    const valueSignals =
+      opportunities.filter(
+        o => o.grade === "VALUE"
+      ).length;
+
+    /*
+      Response
     */
 
     return res.status(200).json({
+      ok: true,
 
-      date,
+      date: requestedDate,
 
-      source:
-        "API-Football",
+      timezone: TIMEZONE,
 
-      fixtures:
-        fixtures.length,
+      source: "API-Football",
 
-      analysed,
+      fixturesScanned: fixtures.length,
 
-      insufficient,
+      fixturesReturnedByAPI:
+        fixtureData.all.length,
 
-      analysisLimit:
-        analysisFixtures.length,
+      fixturesUpcoming:
+        fixtureData.upcoming.length,
 
-      rows
+      paging: fixtureData.paging,
 
+      deepTeamsAnalysed:
+        selectedTeamIds.length,
+
+      deepTeamLimit:
+        MAX_DEEP_TEAMS,
+
+      strongSignals,
+
+      valueSignals,
+
+      averageConfidence,
+
+      opportunities,
+
+      fixtures: analyses,
+
+      diagnostics: {
+        apiConnected: true,
+
+        message:
+          "Daily fixture discovery is working. Deep historical analysis is intentionally quota-controlled.",
+
+        nextUpgrade:
+          "Rank all fixtures first, then spend historical/statistics requests only on the strongest candidates."
+      }
     });
 
   } catch (error) {
-
-    console.error(error);
+    console.error("Scanner error:", error);
 
     return res.status(500).json({
+      ok: false,
 
       error:
         error?.message ||
-        "Scanner failed",
+        "Unknown scanner error",
 
-      date
-
+      hint:
+        "Check API_FOOTBALL_KEY, Vercel deployment logs, and API quota."
     });
   }
-      }
+}
